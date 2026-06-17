@@ -95,7 +95,6 @@ pipeline {
                         def httpStatus = sh(
                             script: """
                                 curl -s -o response.json -w '%{http_code}' \
-                                     --max-time 600 \
                                      -X POST '${BACKEND_API_URL}' \
                                      -F 'design_file=@${file}'
                             """,
