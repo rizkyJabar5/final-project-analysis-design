@@ -1,0 +1,56 @@
+@startuml InventoryManagementInsecure
+left to right direction
+skinparam packageStyle rectangle
+skinparam actorStyle awesome
+skinparam usecase {
+  BackgroundColor #FFcccc
+  BorderColor #cc0000
+  ArrowColor #333333
+}
+skinparam rectangle {
+  BackgroundColor #fff2cc
+  BorderColor #d6b656
+}
+
+title Inventory Management System\n(STRIDE Insecure Design)
+
+actor "Manager" as Manager
+actor "Warehouse Staff" as Warehouse
+actor "System Admin" as Admin
+
+rectangle "Inventory Management System" {
+  usecase "Login" as UC_Login
+  usecase "View Inventory" as UC_View
+  usecase "Add Item" as UC_Add
+  usecase "Update Stock" as UC_Update
+  usecase "Delete Data" as UC_Delete
+  usecase "Generate Report" as UC_Report
+  usecase "Manage Users" as UC_ManageUsers
+  usecase "Backup Database" as UC_Backup
+}
+
+Manager --> UC_Login
+Manager --> UC_View
+Manager --> UC_Add
+Manager --> UC_Update
+Manager --> UC_Delete
+Manager --> UC_Report
+Manager --> UC_ManageUsers
+Manager --> UC_Backup
+
+Warehouse --> UC_Login
+Warehouse --> UC_View
+Warehouse --> UC_Add
+Warehouse --> UC_Update
+Warehouse --> UC_Delete
+
+Admin --> UC_Login
+Admin --> UC_View
+Admin --> UC_ManageUsers
+Admin --> UC_Backup
+
+UC_Delete ..> UC_Login : <<include>>
+UC_Report ..> UC_View : <<include>>
+UC_ManageUsers ..> UC_Login : <<include>>
+
+@enduml
