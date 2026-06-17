@@ -1,0 +1,314 @@
+name: CI - Watch Jenkins
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+    inputs:
+      jenkins_job:
+        description: "Override Jenkins job name"
+        required: false
+
+jobs:
+  watch-jenkins:
+    name: Watch Jenkins Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Secrets are not available on PRs from forks — skip cleanly.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+
+    env:
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      JENKINS_USER: ${{ secrets.JENKINS_USER }}
+      JENKINS_TOKEN: ${{ secrets.JENKINS_TOKEN }}
+      # Multibranch parent folder name (e.g. "my-app").
+      JENKINS_JOB: ${{ github.event.inputs.jenkins_job || secrets.JENKINS_JOB }}
+      # On a PR, the GitHub Branch Source plugin creates a job called "PR-<number>".
+      # On a push, the branch job matches the ref name (e.g. "master", "feature/foo").
+      JENKINS_BRANCH: ${{ github.event_name == 'pull_request' && format('PR-{0}', github.event.pull_request.number) || github.ref_name }}
+      # Head SHA on PRs (Jenkins may also record the merge SHA — we match either).
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Validate Jenkins secrets
+        run: |
+          set -euo pipefail
+          missing=0
+          for v in JENKINS_URL JENKINS_USER JENKINS_TOKEN JENKINS_JOB JENKINS_BRANCH; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::Missing required secret/env: $v"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Add the missing values at Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Fetch CSRF crumb
+        id: crumb
+        run: |
+          set -euo pipefail
+          CRUMB_JSON=$(curl -sS --fail -u "${JENKINS_USER}:${JENKINS_TOKEN}" \
+            "${JENKINS_URL%/}/crumbIssuer/api/json" || echo "")
+
+          if [ -n "$CRUMB_JSON" ] && echo "$CRUMB_JSON" | jq -e .crumb >/dev/null 2>&1; then
+            FIELD=$(echo "$CRUMB_JSON" | jq -r .crumbRequestField)
+            VALUE=$(echo "$CRUMB_JSON" | jq -r .crumb)
+            echo "header=${FIELD}: ${VALUE}" >> "$GITHUB_OUTPUT"
+            echo "Crumb acquired (${FIELD})"
+          else
+            echo "header=" >> "$GITHUB_OUTPUT"
+            echo "No CSRF crumb required."
+          fi
+
+      - name: Trigger multibranch scan
+        run: |
+          set -euo pipefail
+          ENC_PARENT=$(printf '%s' "${JENKINS_JOB}" | jq -sRr @uri)
+          SCAN_URL="${JENKINS_URL%/}/job/${ENC_PARENT}/build?delay=0sec"
+
+          echo "Triggering scan: $SCAN_URL"
+
+          ARGS=(-sS -w "\nHTTP_CODE:%{http_code}\n"
+                -u "${JENKINS_USER}:${JENKINS_TOKEN}"
+                -X POST)
+          if [ -n "${{ steps.crumb.outputs.header }}" ]; then
+            ARGS+=(-H "${{ steps.crumb.outputs.header }}")
+          fi
+
+          RESPONSE=$(curl "${ARGS[@]}" "$SCAN_URL" || true)
+          HTTP=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | sed '/HTTP_CODE:/d')
+
+          echo "Scan trigger HTTP: $HTTP"
+          [ -n "$BODY" ] && echo "Response body: $BODY"
+
+          case "$HTTP" in
+            200|201|302) echo "Scan requested successfully." ;;
+            401|403) echo "::error::Jenkins auth failed — check JENKINS_USER and JENKINS_TOKEN." ;;
+            404) echo "::error::Job not found at ${SCAN_URL} — check JENKINS_JOB name." ;;
+            *) echo "::warning::Scan trigger returned HTTP $HTTP — relying on webhook." ;;
+          esac
+
+      - name: Verify branch job exists
+        run: |
+          set -euo pipefail
+          ENC_PARENT=$(printf '%s' "${JENKINS_JOB}" | jq -sRr @uri)
+          ENC_BRANCH=$(printf '%s' "${JENKINS_BRANCH}" | jq -sRr @uri)
+          BRANCH_URL="${JENKINS_URL%/}/job/${ENC_PARENT}/job/${ENC_BRANCH}"
+
+          echo "Checking branch job: $BRANCH_URL"
+          HTTP=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -u "${JENKINS_USER}:${JENKINS_TOKEN}" \
+            "${BRANCH_URL}/api/json" || echo "000")
+
+          echo "Branch job HTTP: $HTTP"
+          if [ "$HTTP" = "404" ]; then
+            echo "::warning::Branch job '${JENKINS_BRANCH}' not found — Jenkins may not have scanned yet."
+            echo "Check Jenkins webhook configuration:"
+            echo "  1. Go to Jenkins → Manage Jenkins → System"
+            echo "  2. Under 'GitHub', ensure webhook is set to: ${JENKINS_URL%/}/github-webhook/"
+            echo "  3. Ensure the multibranch job has 'GitHub hook trigger for GITScm polling' enabled"
+          elif [ "$HTTP" = "200" ]; then
+            echo "Branch job exists."
+          else
+            echo "::warning::Unexpected response: HTTP $HTTP"
+          fi
+
+      - name: Find Jenkins build for ${{ env.HEAD_SHA }}
+        id: find
+        run: |
+          set -euo pipefail
+          ENC_PARENT=$(printf '%s' "${JENKINS_JOB}" | jq -sRr @uri)
+          ENC_BRANCH=$(printf '%s' "${JENKINS_BRANCH}" | jq -sRr @uri)
+          BRANCH_URL="${JENKINS_URL%/}/job/${ENC_PARENT}/job/${ENC_BRANCH}"
+          TREE=$(printf 'builds[number,url,building,result,timestamp]' | jq -sRr @uri)
+
+          echo "Watching: $BRANCH_URL"
+          echo "Looking for SHA: $HEAD_SHA"
+          echo "Branch: ${JENKINS_BRANCH}"
+
+          # Snapshot of build numbers known before this workflow run.
+          KNOWN_BEFORE=""
+          for i in $(seq 1 60); do
+            JSON=$(curl -sS -g -u "${JENKINS_USER}:${JENKINS_TOKEN}" \
+              "${BRANCH_URL}/api/json?tree=${TREE}" || echo "")
+
+            if [ -n "$JSON" ] && echo "$JSON" | jq -e .builds >/dev/null 2>&1; then
+              # Record known build numbers on first successful fetch.
+              if [ -z "$KNOWN_BEFORE" ]; then
+                KNOWN_BEFORE=$(echo "$JSON" | jq -r '.builds[].number' 2>/dev/null | sort -n | tr '\n' ' ')
+                echo "Known builds before this run: ${KNOWN_BEFORE:-<none>}"
+              fi
+
+              BUILDING=$(echo "$JSON" | jq -r '.builds[]? | select(.building == true) | .number' 2>/dev/null)
+              if [ -n "$BUILDING" ]; then
+                echo "Build #${BUILDING} is currently building... (${i}/60)"
+                sleep 10
+                continue
+              fi
+
+              LATEST=$(echo "$JSON" | jq -r '.builds[0].number // empty')
+              LATEST_RESULT=$(echo "$JSON" | jq -r '.builds[0].result // empty')
+
+              if [ -z "$LATEST" ]; then
+                echo "No builds found yet, waiting... (${i}/60)"
+                sleep 10
+                continue
+              fi
+
+              # Skip builds that already existed before this run.
+              if echo "$KNOWN_BEFORE" | grep -qw "$LATEST"; then
+                echo "Build #${LATEST} existed before this run, waiting for new build... (${i}/60)"
+                sleep 10
+                continue
+              fi
+
+              if [ "$LATEST_RESULT" = "null" ] || [ -z "$LATEST_RESULT" ]; then
+                echo "Build #${LATEST} still running, waiting... (${i}/60)"
+                sleep 10
+                continue
+              fi
+
+              BUILD_URL=$(echo "$JSON" | jq -r '.builds[0].url')
+              echo "Latest new build: #${LATEST} (${LATEST_RESULT})"
+              echo "url=$BUILD_URL" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Waiting for Jenkins... (${i}/60)"
+            sleep 10
+          done
+
+          echo "::error::No Jenkins build found after 10 minutes."
+          echo "::error::Verify the multibranch job '${JENKINS_JOB}' has scanned and created '${JENKINS_BRANCH}'."
+          exit 1
+
+      - name: Wait for build & render stage summary
+        id: result
+        run: |
+          set -euo pipefail
+          BUILD_URL="${{ steps.find.outputs.url }}"
+          WFAPI_URL="${BUILD_URL%/}/wfapi/describe"
+          BUILD_NUM=$(printf '%s' "$BUILD_URL" | sed -E 's|.*/([0-9]+)/?$|\1|')
+          SHORT_SHA="${HEAD_SHA:0:7}"
+
+          # Snapshot the current build number so we can detect newer ones.
+          CURRENT_NUM="$BUILD_NUM"
+
+          # jq helpers shared by the live log + the final summary table.
+          read -r -d '' JQ_HELPERS <<'JQ' || true
+          def status_emoji:
+            if   . == "SUCCESS"             then "✅ SUCCESS"
+            elif . == "FAILED" or . == "FAILURE" then "❌ FAILED"
+            elif . == "UNSTABLE"            then "⚠️ UNSTABLE"
+            elif . == "ABORTED"             then "🛑 ABORTED"
+            elif . == "IN_PROGRESS"         then "⏳ RUNNING"
+            elif . == "NOT_EXECUTED"        then "⏭️ SKIPPED"
+            elif . == "PAUSED_PENDING_INPUT" then "⏸️ INPUT"
+            elif . == "QUEUED"              then "🕗 QUEUED"
+            else .
+            end;
+          def fmt_dur:
+            if . == null or . == 0 then "—"
+            else (./1000 | floor) as $s
+              | if $s < 60 then "\($s)s"
+                else "\(($s / 60 | floor))m \($s % 60)s"
+                end
+            end;
+          JQ
+
+          RESULT=""
+          JSON=""
+          for i in $(seq 1 180); do
+
+            # Every 5th poll (~50s), check for a newer build in the branch.
+            if [ $((i % 5)) -eq 1 ]; then
+              ENC_PARENT=$(printf '%s' "${JENKINS_JOB}" | jq -sRr @uri)
+              ENC_BRANCH=$(printf '%s' "${JENKINS_BRANCH}" | jq -sRr @uri)
+              BRANCH_URL="${JENKINS_URL%/}/job/${ENC_PARENT}/job/${ENC_BRANCH}"
+              TREE_LATEST=$(printf 'builds[number,result]' | jq -sRr @uri)
+              LATEST_JSON=$(curl -sS -g -u "${JENKINS_USER}:${JENKINS_TOKEN}" \
+                "${BRANCH_URL}/api/json?tree=${TREE_LATEST}" 2>/dev/null || echo "")
+              LATEST_NUM=$(echo "$LATEST_JSON" | jq -r '.builds[0].number // empty' 2>/dev/null)
+              if [ -n "$LATEST_NUM" ] && [ "$LATEST_NUM" != "$CURRENT_NUM" ]; then
+                LATEST_RES=$(echo "$LATEST_JSON" | jq -r '.builds[0].result // "IN_PROGRESS"')
+                LATEST_URL=$(echo "$LATEST_JSON" | jq -r '.builds[0].url // empty')
+                echo ">> Newer build detected: #${LATEST_NUM} (${LATEST_RES}) — switching from #${CURRENT_NUM}"
+                BUILD_URL="${LATEST_URL:-${BRANCH_URL}/${LATEST_NUM}/}"
+                WFAPI_URL="${BUILD_URL%/}/wfapi/describe"
+                BUILD_NUM="$LATEST_NUM"
+                CURRENT_NUM="$LATEST_NUM"
+              fi
+            fi
+
+            JSON=$(curl -sS -u "${JENKINS_USER}:${JENKINS_TOKEN}" "${WFAPI_URL}" || true)
+            if [ -z "$JSON" ] || ! echo "$JSON" | jq -e .status >/dev/null 2>&1; then
+              echo "Could not read wfapi yet (poll ${i}/180), retrying..."
+              sleep 10
+              continue
+            fi
+
+            STATUS=$(echo "$JSON" | jq -r '.status')
+
+            echo "---- Jenkins #${BUILD_NUM} status: $STATUS (poll ${i}/180) ----"
+            echo "$JSON" | jq -r "${JQ_HELPERS}"' .stages[]? | "  • \(.name) — \(.status | status_emoji)  (\(.durationMillis | fmt_dur))"' || true
+
+            case "$STATUS" in
+              IN_PROGRESS|PAUSED_PENDING_INPUT|QUEUED|NOT_EXECUTED|"") sleep 10 ;;
+              *) RESULT="$STATUS"; break ;;
+            esac
+          done
+
+          if [ -z "$RESULT" ]; then
+            echo "::error::Timed out waiting for Jenkins build to finish — $BUILD_URL"
+            RESULT="TIMEOUT"
+          fi
+
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          echo "build_url=$BUILD_URL" >> "$GITHUB_OUTPUT"
+
+          # Render the live Jenkins stages into the GitHub Step Summary.
+          {
+            echo "### Jenkins build [#${BUILD_NUM}](${BUILD_URL}) — \`${JENKINS_JOB}/${JENKINS_BRANCH}\` @ \`${SHORT_SHA}\`"
+            echo ""
+            if [ -n "$JSON" ] && echo "$JSON" | jq -e .stages >/dev/null 2>&1; then
+              echo "| # | Stage | Status | Duration |"
+              echo "|---|-------|--------|----------|"
+              echo "$JSON" | jq -r "${JQ_HELPERS}"'
+                .stages
+                | to_entries[]
+                | "| \(.key + 1) | \(.value.name) | \(.value.status | status_emoji) | \(.value.durationMillis | fmt_dur) |"
+              '
+              echo ""
+              OVERALL=$(echo "$JSON" | jq -r "${JQ_HELPERS}"' .status | status_emoji')
+              echo "**Overall:** ${OVERALL}  ·  [Open in Jenkins →](${BUILD_URL})"
+            else
+              echo "_No stage data available from Jenkins wfapi._"
+              echo ""
+              echo "- Result: \`${RESULT}\`"
+              echo "- Build: ${BUILD_URL}"
+            fi
+          } > "$GITHUB_STEP_SUMMARY"
+
+          case "$RESULT" in
+            SUCCESS)         echo "::notice::Jenkins build succeeded — $BUILD_URL"; exit 0 ;;
+            UNSTABLE)        echo "::warning::Jenkins build was UNSTABLE — $BUILD_URL"; exit 1 ;;
+            FAILED|FAILURE)  echo "::error::Jenkins build FAILED — $BUILD_URL"; exit 1 ;;
+            ABORTED)         echo "::error::Jenkins build was ABORTED — $BUILD_URL"; exit 1 ;;
+            TIMEOUT)         exit 1 ;;
+            *)               echo "::error::Unknown Jenkins result: $RESULT"; exit 1 ;;
+          esac
+
+      - name: Fallback summary (when build was never found)
+        if: always() && steps.result.outcome == 'skipped'
+        run: |
+          {
+            echo "### Jenkins build"
+            echo ""
+            echo "- Job: \`${JENKINS_JOB}/${JENKINS_BRANCH}\`"
+            echo "- Commit: \`${HEAD_SHA}\`"
+            echo "- Status: build never registered (check Jenkins webhook + scan log)"
+          } > "$GITHUB_STEP_SUMMARY"
