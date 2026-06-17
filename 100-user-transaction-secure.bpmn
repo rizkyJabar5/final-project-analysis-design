@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:open-bpmn="http://open-bpmn.org/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" exporter="Claude" exporterVersion="2.0" id="Definitions_SecureUserTransaction" targetNamespace="http://stride.example/secure-user-transaction">
   <bpmn:process id="Process_SecureUserTransaction" isExecutable="true" name="Secure User Transaction (STRIDE Mitigated)" processType="Public">
     <bpmn:documentation>
@@ -14,7 +15,7 @@
 
       T - Tampering:
         - TLS 1.3 + JWT signature + request signing
-        - [DataStore_Logs] Authenticated encryption (AES-GCM) for integrity protection
+        - [DataStore_Logs] Authenticated encryption (AES-GCM) for integrity protection + Write-once storage
         - [Task_AuditLog] HSM key storage, key rotation, unauthorized use monitoring
         - [Task_IssueJWT] HSM key storage, regular key rotation, short token lifetimes
         - [Flow_4] mTLS between Authenticate and Gateway_Auth
@@ -25,6 +26,9 @@
         - [Flow_10] mTLS between ValidateInput and TransactDB
 
       R - Repudiation: Immutable audit log + signed entries
+        - [Task_UserLogin] Logs all login attempts (username, timestamp, outcome) to immutable audit log
+        - [Task_Authz] Logs all authorization decisions (allow/deny) with user identity, resource, and action
+        - [Task_IssueJWT] Logs JWT issuance events (subject, scopes, expiry) to immutable audit log
 
       I - Information Disclosure:
         - TDE + PII redaction + encrypted backups
@@ -38,8 +42,9 @@
 
       D - Denial of Service:
         - Rate limiting + WAF + DDoS mitigation
-        - [Task_TransactDB] Rate limiting and throttling at application/gateway level
+        - [Task_TransactDB] Rate limiting, throttling, query timeouts, and resource limits (max execution time, memory limits)
         - [Task_TLS] Connection limits, rate limiting at network edge, DDoS services
+        - [DataStore_Logs] Write-once storage with regular backups and integrity checks to prevent log deletion
 
       E - Elevation of Privilege:
         - RBAC + OPA + least privilege DB user
@@ -57,8 +62,8 @@
       <bpmn:incoming>Flow_1</bpmn:incoming>
       <bpmn:outgoing>Flow_2</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:userTask id="Task_UserLogin" name="User Login (Username + Password + MFA + Biometric)">
-      <bpmn:documentation id="documentation_login"/>
+    <bpmn:userTask id="Task_UserLogin" name="User Login (Username + Password + MFA + Biometric + Login Attempt Logging)">
+      <bpmn:documentation id="documentation_login">Logs all login attempts (username, timestamp, outcome) to immutable audit log for repudiation prevention.</bpmn:documentation>
       <bpmn:incoming>Flow_2</bpmn:incoming>
       <bpmn:outgoing>Flow_3</bpmn:outgoing>
     </bpmn:userTask>
@@ -77,8 +82,8 @@
       <bpmn:documentation id="documentation_reject"/>
       <bpmn:incoming>Flow_NoAuth</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:serviceTask id="Task_IssueJWT" name="Issue JWT (RS256 Signed, HSM Key, Short Expiry, Scope Bound, Key Rotation)">
-      <bpmn:documentation id="documentation_issue_jwt"/>
+    <bpmn:serviceTask id="Task_IssueJWT" name="Issue JWT (RS256 Signed, HSM Key, Short Expiry, Scope Bound, Key Rotation + JWT Issuance Logging)">
+      <bpmn:documentation id="documentation_issue_jwt">Logs JWT issuance events (subject, scopes, expiry, timestamp) to the immutable audit log for repudiation prevention.</bpmn:documentation>
       <bpmn:incoming>Flow_5</bpmn:incoming>
       <bpmn:outgoing>Flow_6</bpmn:outgoing>
     </bpmn:serviceTask>
@@ -97,8 +102,8 @@
       <bpmn:documentation id="documentation_invalid_jwt"/>
       <bpmn:incoming>Flow_InvalidJWT</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:serviceTask id="Task_Authz" name="RBAC + OPA Policy-as-Code + Scope Check + Version Control + Automated Testing">
-      <bpmn:documentation id="documentation_authz"/>
+    <bpmn:serviceTask id="Task_Authz" name="RBAC + OPA Policy-as-Code + Scope Check + Version Control + Automated Testing + Auth Decision Logging">
+      <bpmn:documentation id="documentation_authz">Logs all authorization decisions (allow/deny) with user identity, resource, and action to the immutable audit log for repudiation prevention.</bpmn:documentation>
       <bpmn:incoming>Flow_8</bpmn:incoming>
       <bpmn:outgoing>Flow_9</bpmn:outgoing>
     </bpmn:serviceTask>
@@ -107,8 +112,8 @@
       <bpmn:incoming>Flow_9</bpmn:incoming>
       <bpmn:outgoing>Flow_10</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:serviceTask id="Task_TransactDB" name="Execute Transaction (Parameterized Query + TDE + KMS + Constraints + Rate Limit)">
-      <bpmn:documentation id="documentation_transact_db"/>
+    <bpmn:serviceTask id="Task_TransactDB" name="Execute Transaction (Parameterized Query + TDE + KMS + Constraints + Rate Limit + Query Timeout + Resource Limits)">
+      <bpmn:documentation id="documentation_transact_db">Configures database query timeouts and resource limits (max execution time, memory limits) to prevent slow query attacks and resource exhaustion.</bpmn:documentation>
       <bpmn:incoming>Flow_10</bpmn:incoming>
       <bpmn:outgoing>Flow_11</bpmn:outgoing>
       <bpmn:dataOutputAssociation id="DOA_TxDB">
@@ -142,8 +147,8 @@
     <bpmn:dataStoreReference id="DataStore_AuditLog" name="Immutable Audit Log (WORM + HSM Signed + TDE/KMS Encrypted)">
       <bpmn:documentation id="documentation_audit"/>
     </bpmn:dataStoreReference>
-    <bpmn:dataStoreReference id="DataStore_Logs" name="Centralized Logs (Redacted + AES-GCM Authenticated Encryption)">
-      <bpmn:documentation id="documentation_logs"/>
+    <bpmn:dataStoreReference id="DataStore_Logs" name="Centralized Logs (Redacted + AES-GCM Authenticated Encryption + Write-Once Storage + Regular Backups + Integrity Checks)">
+      <bpmn:documentation id="documentation_logs">Write-once storage with regular backups and integrity checks to prevent log deletion by attackers.</bpmn:documentation>
     </bpmn:dataStoreReference>
     <bpmn:sequenceFlow id="Flow_1" sourceRef="StartEvent_1" targetRef="Task_TLS">
       <bpmn:documentation id="documentation_f1"/>
@@ -364,3 +369,4 @@
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>
 </bpmn:definitions>
+
