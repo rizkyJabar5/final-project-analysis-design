@@ -16,8 +16,9 @@
       T - Tampering:
         - TLS 1.3 + JWT signature + request signing
         - [DataStore_Logs] Authenticated encryption (AES-GCM) for integrity protection + Write-once storage
-        - [Task_AuditLog] HSM key storage, key rotation, unauthorized use monitoring
+        - [Task_AuditLog] HSM key storage, key rotation, unauthorized use monitoring + Access controls + Encryption at rest/transit + Pre-redaction
         - [Task_IssueJWT] HSM key storage, regular key rotation, short token lifetimes
+        - [Task_Authz] OPA policies deployed read-only in production with controlled deployment pipeline + File integrity monitoring
         - [Flow_4] mTLS between Authenticate and Gateway_Auth
         - [Flow_5] mTLS between Gateway_Auth and IssueJWT
         - [Flow_7] mTLS between ValidateJWT and Gateway_JWT
@@ -29,10 +30,19 @@
         - [Task_UserLogin] Logs all login attempts (username, timestamp, outcome) to immutable audit log
         - [Task_Authz] Logs all authorization decisions (allow/deny) with user identity, resource, and action
         - [Task_IssueJWT] Logs JWT issuance events (subject, scopes, expiry) to immutable audit log
+        - [Task_Authenticate] Logs authentication decisions (success/failure) with user ID, timestamp, reason
+        - [Task_ValidateJWT] Logs JWT validation failures with reason and context (token ID, timestamp)
 
       I - Information Disclosure:
         - TDE + PII redaction + encrypted backups
         - [DataStore_AuditLog] TDE or file-level encryption with KMS-managed key
+        - [Task_AuditLog] Access controls on audit log storage, encryption at rest and in transit, pre-redaction of sensitive data
+        - [Task_RedactedLog] Robust PII detection and redaction with regular testing
+        - [Task_Authenticate] Generic error messages that do not reveal specific failure reasons
+        - [Task_Authz] Minimized sensitive information in authorization decision logs
+        - [Task_IssueJWT] Redaction of sensitive claims (e.g., personal data) before logging
+        - [Task_UserLogin] Generic error messages to prevent username enumeration
+        - [Task_ValidateJWT] Generic error messages for validation failures, detailed reasons logged internally
         - [Flow_3] Internal TLS/mTLS for credential transmission
         - [Flow_6] Internal TLS or JWE for JWT payload encryption
         - [Flow_11] TLS/JWE for transaction data before audit logging
@@ -45,10 +55,12 @@
         - [Task_TransactDB] Rate limiting, throttling, query timeouts, and resource limits (max execution time, memory limits)
         - [Task_TLS] Connection limits, rate limiting at network edge, DDoS services
         - [DataStore_Logs] Write-once storage with regular backups and integrity checks to prevent log deletion
+        - [Task_ValidateInput] Input size limits, rate limiting, resource quotas, and timeouts
 
       E - Elevation of Privilege:
         - RBAC + OPA + least privilege DB user
         - [Task_Authz] Policy-as-code with version control, regular reviews, automated testing
+        - [Task_IssueJWT] Strict scope assignment based on authenticated user roles with regular auditing and testing
     </bpmn:documentation>
     <bpmn:extensionElements>
       <open-bpmn:auto-align/>
@@ -62,13 +74,13 @@
       <bpmn:incoming>Flow_1</bpmn:incoming>
       <bpmn:outgoing>Flow_2</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:userTask id="Task_UserLogin" name="User Login (Username + Password + MFA + Biometric + Login Attempt Logging)">
-      <bpmn:documentation id="documentation_login">Logs all login attempts (username, timestamp, outcome) to immutable audit log for repudiation prevention.</bpmn:documentation>
+    <bpmn:userTask id="Task_UserLogin" name="User Login (Username + Password + MFA + Biometric + Login Attempt Logging + Generic Error Messages)">
+      <bpmn:documentation id="documentation_login">Logs all login attempts (username, timestamp, outcome) to immutable audit log for repudiation prevention. Uses generic error messages (e.g., 'Invalid username or password') to prevent username enumeration.</bpmn:documentation>
       <bpmn:incoming>Flow_2</bpmn:incoming>
       <bpmn:outgoing>Flow_3</bpmn:outgoing>
     </bpmn:userTask>
-    <bpmn:serviceTask id="Task_Authenticate" name="Authenticate (bcrypt + HW-Backed Device Attestation + Rate Limit + Anti-Phishing)">
-      <bpmn:documentation id="documentation_authenticate"/>
+    <bpmn:serviceTask id="Task_Authenticate" name="Authenticate (bcrypt + HW-Backed Device Attestation + Rate Limit + Anti-Phishing + Auth Decision Logging + Generic Errors)">
+      <bpmn:documentation id="documentation_authenticate">Logs authentication decisions (success/failure) with user ID, timestamp, and reason internally. Returns generic error messages that do not reveal specific failure reasons (e.g., invalid password vs. invalid device).</bpmn:documentation>
       <bpmn:incoming>Flow_3</bpmn:incoming>
       <bpmn:outgoing>Flow_4</bpmn:outgoing>
     </bpmn:serviceTask>
@@ -82,13 +94,13 @@
       <bpmn:documentation id="documentation_reject"/>
       <bpmn:incoming>Flow_NoAuth</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:serviceTask id="Task_IssueJWT" name="Issue JWT (RS256 Signed, HSM Key, Short Expiry, Scope Bound, Key Rotation + JWT Issuance Logging)">
-      <bpmn:documentation id="documentation_issue_jwt">Logs JWT issuance events (subject, scopes, expiry, timestamp) to the immutable audit log for repudiation prevention.</bpmn:documentation>
+    <bpmn:serviceTask id="Task_IssueJWT" name="Issue JWT (RS256 Signed, HSM Key, Short Expiry, Scope Bound, Key Rotation + JWT Issuance Logging + Sensitive Claim Redaction + Strict Scope Assignment)">
+      <bpmn:documentation id="documentation_issue_jwt">Logs JWT issuance events (subject, scopes, expiry, timestamp) to the immutable audit log. Redacts sensitive claims (e.g., personal data) before logging. Implements strict scope assignment based on authenticated user roles and permissions with regular auditing and testing.</bpmn:documentation>
       <bpmn:incoming>Flow_5</bpmn:incoming>
       <bpmn:outgoing>Flow_6</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:serviceTask id="Task_ValidateJWT" name="Validate JWT (Verify Signature + Issuer + Audience + Expiry + Scope)">
-      <bpmn:documentation id="documentation_validate_jwt"/>
+    <bpmn:serviceTask id="Task_ValidateJWT" name="Validate JWT (Verify Signature + Issuer + Audience + Expiry + Scope + Validation Failure Logging + Generic Errors)">
+      <bpmn:documentation id="documentation_validate_jwt">Logs JWT validation failures with reason and context (token ID, timestamp) for repudiation prevention. Returns generic error messages for validation failures without revealing specific reasons (e.g., expired, wrong issuer). Detailed reasons logged internally only.</bpmn:documentation>
       <bpmn:incoming>Flow_6</bpmn:incoming>
       <bpmn:outgoing>Flow_7</bpmn:outgoing>
     </bpmn:serviceTask>
@@ -102,13 +114,13 @@
       <bpmn:documentation id="documentation_invalid_jwt"/>
       <bpmn:incoming>Flow_InvalidJWT</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:serviceTask id="Task_Authz" name="RBAC + OPA Policy-as-Code + Scope Check + Version Control + Automated Testing + Auth Decision Logging">
-      <bpmn:documentation id="documentation_authz">Logs all authorization decisions (allow/deny) with user identity, resource, and action to the immutable audit log for repudiation prevention.</bpmn:documentation>
+    <bpmn:serviceTask id="Task_Authz" name="RBAC + OPA Policy-as-Code + Scope Check + Version Control + Automated Testing + Auth Decision Logging + Read-Only Policies + Minimized Log Info">
+      <bpmn:documentation id="documentation_authz">Logs authorization decisions (allow/deny) with user identity, resource, and action to the immutable audit log. OPA policies deployed read-only in production with changes only through controlled deployment pipeline. File integrity monitoring on policy files. Minimizes sensitive information in authorization decision logs.</bpmn:documentation>
       <bpmn:incoming>Flow_8</bpmn:incoming>
       <bpmn:outgoing>Flow_9</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:serviceTask id="Task_ValidateInput" name="Input Validation + Allowlist + Parameterized Query">
-      <bpmn:documentation id="documentation_validate_input"/>
+    <bpmn:serviceTask id="Task_ValidateInput" name="Input Validation + Allowlist + Parameterized Query + Input Size Limits + Rate Limiting + Resource Quotas">
+      <bpmn:documentation id="documentation_validate_input">Implements input size limits and rate limiting at the input validation stage. Uses resource quotas and timeouts to prevent resource exhaustion from large payloads.</bpmn:documentation>
       <bpmn:incoming>Flow_9</bpmn:incoming>
       <bpmn:outgoing>Flow_10</bpmn:outgoing>
     </bpmn:serviceTask>
@@ -120,8 +132,8 @@
         <bpmn:targetRef>DataStore_TxDB</bpmn:targetRef>
       </bpmn:dataOutputAssociation>
     </bpmn:serviceTask>
-    <bpmn:scriptTask id="Task_AuditLog" name="Sign &amp; Append Audit Log (WORM, Immutable, HSM Key, Key Rotation)">
-      <bpmn:documentation id="documentation_audit_log"/>
+    <bpmn:scriptTask id="Task_AuditLog" name="Sign &amp; Append Audit Log (WORM, Immutable, HSM Key, Key Rotation + Access Controls + Encryption at Rest/Transit + Pre-Redaction)">
+      <bpmn:documentation id="documentation_audit_log">Implements access controls on audit log storage, encryption at rest and in transit, and redacts sensitive information before writing to the audit log.</bpmn:documentation>
       <bpmn:incoming>Flow_11</bpmn:incoming>
       <bpmn:outgoing>Flow_12</bpmn:outgoing>
       <bpmn:dataOutputAssociation id="DOA_Audit">
@@ -129,8 +141,8 @@
       </bpmn:dataOutputAssociation>
       <bpmn:script id="script_audit"/>
     </bpmn:scriptTask>
-    <bpmn:serviceTask id="Task_RedactedLog" name="Centralized Logging with PII Redaction (AES-GCM Authenticated Encryption)">
-      <bpmn:documentation id="documentation_redacted_log"/>
+    <bpmn:serviceTask id="Task_RedactedLog" name="Centralized Logging with PII Redaction (AES-GCM Authenticated Encryption + Robust PII Detection + Regular Testing)">
+      <bpmn:documentation id="documentation_redacted_log">Implements robust PII detection and redaction mechanisms. Regularly tests the redaction process with sample data to ensure effectiveness and prevent sensitive information leakage.</bpmn:documentation>
       <bpmn:incoming>Flow_12</bpmn:incoming>
       <bpmn:outgoing>Flow_13</bpmn:outgoing>
       <bpmn:dataOutputAssociation id="DOA_Logs">
